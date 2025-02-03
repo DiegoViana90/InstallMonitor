@@ -7,6 +7,9 @@ using System.Threading.Tasks;
 using System.Runtime.Versioning;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Win32;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
 
 namespace InstallMonitor
 {
@@ -14,15 +17,44 @@ namespace InstallMonitor
     public class Worker : BackgroundService
     {
         private readonly string logFilePath = "C:\\InstallMonitor\\install_log.txt";
+        private readonly ConcurrentDictionary<string, FileInfo> trackedFiles = new ConcurrentDictionary<string, FileInfo>();
+        private readonly List<FileSystemWatcher> watchers = new List<FileSystemWatcher>();
+
+        private readonly List<string> ignoredPaths;
+        private readonly List<string> monitoredPaths;
+
+        public Worker()
+        {
+            string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            ignoredPaths = new List<string>
+            {
+                Path.Combine(userProfile, "AppData", "Local", "Google", "Chrome"),
+                Path.Combine(userProfile, "AppData", "Local", "Temp"),
+                Path.Combine(userProfile, "AppData", "Roaming", "Microsoft", "Windows", "Recent"),
+                Path.Combine(userProfile, "AppData", "Local", "Microsoft", "VSApplicationInsights"),
+                @"C:\Windows\Prefetch",
+                @"C:\Windows\System32\LogFiles"
+            };
+
+            monitoredPaths = new List<string>
+            {
+                Path.Combine(userProfile, "Desktop"),
+                Path.Combine(userProfile, "Documents"),
+                Path.Combine(userProfile, "Downloads"),
+                @"C:\Program Files",
+                @"C:\Program Files (x86)"
+            };
+        }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
             Console.WriteLine("Installation monitor started...");
             Directory.CreateDirectory("C:\\InstallMonitor");
 
-            await Task.Run(() => MonitorProcesses());
-            await Task.Run(() => MonitorRegistry());
-            await Task.Run(() => MonitorFiles());
+            _ = Task.Run(() => MonitorProcesses(), stoppingToken);
+            _ = Task.Run(() => MonitorRegistry(), stoppingToken);
+            _ = Task.Run(() => MonitorFiles(), stoppingToken);
+            _ = Task.Run(() => ScanFileSystem(stoppingToken), stoppingToken);
 
             while (!stoppingToken.IsCancellationRequested)
             {
@@ -57,6 +89,7 @@ namespace InstallMonitor
                 Log($"❌ Error monitoring processes: {ex.Message}");
             }
         }
+
         private string GetProcessPath(int processId)
         {
             try
@@ -77,90 +110,92 @@ namespace InstallMonitor
             return "Path not found";
         }
 
-
-      private void MonitorRegistry()
-{
-    Console.WriteLine("Starting Windows registry monitoring...");
-
-    string registryPath = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
-    RegistryKey? key = Registry.LocalMachine.OpenSubKey(registryPath, true);
-
-    if (key == null) return;
-
-    List<string> installedPrograms = new List<string>(key.GetSubKeyNames());
-
-    while (true)
-    {
-        Thread.Sleep(5000); // Check every 5 seconds
-        key = Registry.LocalMachine.OpenSubKey(registryPath, true);
-        if (key == null) continue;
-
-        List<string> newPrograms = new List<string>(key.GetSubKeyNames());
-        foreach (var program in newPrograms)
+        private void MonitorRegistry()
         {
-            if (!installedPrograms.Contains(program))
+            Console.WriteLine("Starting Windows registry monitoring...");
+
+            string registryPath = @"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+            RegistryKey? key = Registry.LocalMachine.OpenSubKey(registryPath, true);
+
+            if (key == null) return;
+
+            previousOwner = key.GetValue("RegisteredOwner")?.ToString() ?? "Unknown";
+
+            while (true)
             {
-                Log($"🟢 New software installed: {program}");
-                installedPrograms.Add(program);
+                Thread.Sleep(5000);
+                key = Registry.LocalMachine.OpenSubKey(registryPath, true);
+                if (key == null) continue;
+
+                string registeredOwner = key.GetValue("RegisteredOwner")?.ToString() ?? "Unknown";
+                if (registeredOwner != previousOwner)
+                {
+                    Log($"📝 Registry modified: {registryPath}\\RegisteredOwner | New Value: {registeredOwner}");
+                    previousOwner = registeredOwner;
+                }
             }
         }
 
-        // Capturar mudanças nos valores do registro (como "RegisteredOwner")
-        string registeredOwner = key.GetValue("RegisteredOwner")?.ToString() ?? "Unknown";
-        if (registeredOwner != previousOwner)
-        {
-            Log($"📝 Registry modified: {registryPath}\\RegisteredOwner | New Value: {registeredOwner}");
-            previousOwner = registeredOwner;
-        }
-    }
-}
-
-// Variável global para armazenar o valor anterior
-private string previousOwner = string.Empty;
-
+        private string previousOwner = string.Empty;
 
         private void MonitorFiles()
         {
             Console.WriteLine("Starting file monitoring...");
 
-            string[] drives = Environment.GetLogicalDrives(); // Get all drives (C:, D:, etc.)
-
-            foreach (string drive in drives)
+            foreach (string path in monitoredPaths)
             {
                 try
                 {
-                    FileSystemWatcher watcher = new FileSystemWatcher(drive)
+                    if (!Directory.Exists(path)) continue;
+
+                    FileSystemWatcher watcher = new FileSystemWatcher(path)
                     {
                         IncludeSubdirectories = true,
-                        EnableRaisingEvents = true
+                        EnableRaisingEvents = true,
+                        NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite
                     };
 
-                    watcher.Created += (sender, e) => LogFileDetails(e.FullPath, "📂 New file created");
-                    watcher.Changed += (sender, e) => LogFileDetails(e.FullPath, "📝 File modified");
-                    watcher.Deleted += (sender, e) => LogFileDetails(e.FullPath, "🗑️ File deleted");
-                    watcher.Renamed += (sender, e) => LogFileDetails(e.FullPath, "🔄 File renamed");
+                    watcher.Created += (sender, e) => { if (!IsIgnored(e.FullPath)) Log($"📂 New file created: {e.FullPath}"); };
+                    watcher.Changed += (sender, e) => { if (!IsIgnored(e.FullPath)) Log($"📝 File modified: {e.FullPath}"); };
+                    watcher.Deleted += (sender, e) => { if (!IsIgnored(e.FullPath)) Log($"🗑️ File deleted: {e.FullPath}"); };
+                    watcher.Renamed += (sender, e) => { if (!IsIgnored(e.FullPath)) Log($"🔄 File renamed: {e.OldFullPath} -> {e.FullPath}"); };
+
+                    watchers.Add(watcher);
                 }
                 catch (Exception ex)
                 {
-                    Log($"❌ Error monitoring {drive}: {ex.Message}");
+                    Log($"❌ Error monitoring {path}: {ex.Message}");
                 }
             }
         }
 
-        private void LogFileDetails(string filePath, string action)
+        private bool IsIgnored(string filePath)
         {
-            try
-            {
-                FileInfo fileInfo = new FileInfo(filePath);
-                string logMessage = $"{action}: {fileInfo.FullName} | " +
-                                    $"Size: {fileInfo.Length / 1024} KB | " +
-                                    $"Last Modified: {fileInfo.LastWriteTime}";
+            return ignoredPaths.Any(path => filePath.StartsWith(path, StringComparison.OrdinalIgnoreCase)) || 
+                   filePath.Equals(logFilePath, StringComparison.OrdinalIgnoreCase);
+        }
 
-                Log(logMessage);
-            }
-            catch (Exception)
+        private async Task ScanFileSystem(CancellationToken stoppingToken)
+        {
+            while (!stoppingToken.IsCancellationRequested)
             {
-                Log($"{action}: {filePath} (File details unavailable)");
+                await Task.Delay(5000, stoppingToken);
+
+                var filesToRemove = new List<string>();
+
+                foreach (var file in trackedFiles.Keys)
+                {
+                    if (!File.Exists(file))
+                    {
+                        Log($"🗑️ File deleted (detected by scan): {file}");
+                        filesToRemove.Add(file);
+                    }
+                }
+
+                foreach (var file in filesToRemove)
+                {
+                    trackedFiles.TryRemove(file, out _);
+                }
             }
         }
 
@@ -169,12 +204,11 @@ private string previousOwner = string.Empty;
             string logMessage = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} | {message}";
             File.AppendAllText(logFilePath, logMessage + "\n");
 
-            // Exibir com cor no terminal
-            Console.ForegroundColor = message.Contains("New software installed") ? ConsoleColor.Green :
+            Console.ForegroundColor = message.Contains("New file created") ? ConsoleColor.Magenta :
                                       message.Contains("Process started") ? ConsoleColor.Cyan :
                                       message.Contains("File modified") ? ConsoleColor.Yellow :
                                       message.Contains("File deleted") ? ConsoleColor.Red :
-                                      message.Contains("New file created") ? ConsoleColor.Magenta :
+                                      message.Contains("File renamed") ? ConsoleColor.Blue :
                                       ConsoleColor.White;
 
             Console.WriteLine(logMessage);
